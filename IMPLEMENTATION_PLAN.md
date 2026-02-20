@@ -85,16 +85,16 @@ Key concepts:
 **Goal:** Load a GDSII file and extract polygon geometry organized by layer.
 
 - [x] Research available Julia libraries
-- [ ] Initialize Julia project (`Project.toml`)
-- [ ] Create `src/SemiFlowViz.jl` — main module
-- [ ] Create `src/gds_loader.jl` — GDSII file loading using DeviceLayout.jl
+- [x] Initialize Julia project (`Project.toml`)
+- [x] Create `src/SemiFlowViz.jl` — main module
+- [x] Create `src/gds_loader.jl` — GDSII file loading using DeviceLayout.jl
   - `load_gds(filepath)` → parsed library structure
   - `extract_polygons(cell; layers=nothing)` → Dict of layer → polygon list
   - `list_cells(library)` → cell names
   - `list_layers(cell)` → unique layers present
   - `cell_bounding_box(cell)` → (min_xy, max_xy)
-- [ ] Create `test/runtests.jl` — basic tests
-- [ ] Create a small sample GDSII file for testing (via DeviceLayout.jl)
+- [x] Create `test/runtests.jl` — basic tests
+- [x] Create a small sample GDSII file for testing (via DeviceLayout.jl)
 
 ### Phase 2: 2D Visualization
 
