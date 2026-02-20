@@ -1,382 +1,455 @@
-# Implementation Plan: GDSII to 2D/3D Diagram Generator in Julia
+# Implementation Plan: Semiconductor Process Flow Visualizer in Julia
 
-## Overview
+## Vision
 
-This document describes the architecture and phased implementation plan for a Julia package
-that reads GDSII layout files and generates interactive 2D and 3D diagrams. The primary
-pipeline is:
+A Julia package that reads a GDSII mask layout, accepts a description of fabrication
+process steps (deposition, etch, CMP, implant, …), and builds a 3D material solid model
+incrementally — one step at a time. The primary outputs are:
+
+1. **Interactive 3D view** (GLMakie) to explore the growing structure after each step
+2. **2D cross-section slices** at arbitrary planes, exported as SVG for documentation
+
+The target workflow replaces the common practice of manually drawing process cross-sections
+in PowerPoint, slide by slide, with a scriptable, high-fidelity, automated alternative.
 
 ```
-GDSII file → parse → internal model → flatten hierarchy → triangulate → render
+process_flow.jl (user script)
+       │
+       ├─ load_gds("layout.gds")        → GDSLibrary  (mask polygons)
+       ├─ substrate!(:silicon, 500µm)
+       ├─ deposit!(:sio2, 2nm)
+       ├─ deposit!(:poly, 50nm)
+       ├─ etch!(:poly, mask=layer(1))
+       └─ ...
+              │
+       ProcessSimulator
+              │
+     WorldState snapshots [0..N]
+         /              \
+  3D Renderer          Slicer
+  (GLMakie)            (XZ / YZ / arbitrary plane)
+       │                        │
+  Interactive 3D             2D cross-section polygons
+  step-by-step view          → SVG / PNG export
+```
+
+---
+
+## Architecture
+
+### Core Concept: Material Solids + Surface Map
+
+The 3D structure at any process stage is represented as a collection of **material solids**:
+
+```julia
+struct MaterialSolid
+    material::Symbol              # :silicon, :sio2, :poly, :metal1, …
+    polygon::Vector{Tuple{Float64,Float64}}  # closed 2D XY footprint
+    z_bottom::Float64
+    z_top::Float64
+end
+```
+
+Alongside this, a **surface map** tracks the current top-surface height per XY region
+(a piecewise-constant Z field encoded as a polygon partition):
+
+```julia
+struct SurfaceRegion
+    polygon::Vector{Tuple{Float64,Float64}}
+    z::Float64   # current top-of-stack height in this region
+end
+
+const SurfaceMap = Vector{SurfaceRegion}
+```
+
+Together, these two structures are the **WorldState**:
+
+```julia
+struct WorldState
+    solids::Vector{MaterialSolid}
+    surface::SurfaceMap
+    step_name::String
+end
 ```
 
 ---
 
 ## Library Choices
 
-### GDSII Parsing: Custom Implementation
+### GDS Parsing: Custom (see Phase 1)
+As described in the original plan — a minimal GDSII binary reader. Unchanged.
 
-**Decision**: Write a minimal custom binary parser rather than using `GDS.jl`
-(shobhan126/GDS.jl) or `DeviceLayout.jl`.
+### 2D Polygon Boolean Operations: Clipper.jl
+All deposit/etch masking requires polygon intersection, difference, and union.
+`Clipper.jl` (JuliaGeometry organisation) wraps Angus Johnson's Clipper v6.4.2 and is
+actively maintained. It uses integer coordinates (matching GDSII's native integer DB units
+exactly, avoiding float precision issues):
 
-**Rationale**:
-- `GDS.jl` has unknown maintenance status and limited documentation
-- `DeviceLayout.jl` (aws-cqc) is actively maintained but designed as a full quantum
-  circuit CAD system — its API is oriented around design authoring, not reading arbitrary
-  files for visualization
-- The GDSII binary record format is straightforward and well-documented; a minimal reader
-  is ~400–600 lines of Julia
-- A custom parser gives full control over the internal data model and avoids pulling in
-  a heavy transitive dependency tree
+```julia
+using Clipper
+c = Clipper.Clip()
+add_path!(c, subject_path, Clipper.PolyTypeSubject, true)
+add_path!(c, clip_path,    Clipper.PolyTypeClip,    true)
+result = execute(c, Clipper.ClipTypeDifference, Clipper.PolyFillTypeNonZero)
+```
 
-The format consists of sequential binary records, each with a 2-byte length, 2-byte record
-type/datatype tag, and variable-length payload. There are seven element types to handle:
-BOUNDARY (polygon), PATH (wire), SREF (cell instance), AREF (cell array), TEXT, NODE, BOX.
+Polygon offsetting (for conformal deposition rounding, future work) is handled by
+`Clipper.ClipperOffset`.
 
-### Polygon Triangulation: Triangulate.jl + EarCut.jl
+### Polygon Triangulation: EarCut.jl + Triangulate.jl
+For converting 2D material solid footprints into triangulated surfaces for 3D rendering.
+- **EarCut.jl** for simple polygons (fast, good enough for rendering)
+- **Triangulate.jl** when quality meshes with quality constraints are needed (e.g. FEM
+  export)
 
-- **`Triangulate.jl`** — wrapper for Shewchuk's Triangle library. Used for high-quality
-  constrained Delaunay triangulation (CDT) with quality constraints (minimum angle,
-  maximum area). Ideal for simulation-quality meshes and polygons with holes.
-- **`EarCut.jl`** — wrapper for Mapbox's earcut.hpp. Fast ear-clipping triangulation for
-  simple convex/concave polygons without holes. Good default for visualization.
+### 3D Geometry: GeometryBasics.jl
+`Point3f`, `TriangleFace`, `Mesh` — the standard Julia geometry type that integrates
+natively with Makie renderers.
 
-Use EarCut.jl as the default fast path; fall back to Triangulate.jl when quality mesh
-output is requested or when polygons have interior holes.
+### 3D Visualization: GLMakie
+Interactive camera, real-time updates via `Observable`s, per-material color and
+transparency. `WGLMakie` supported as an alternative backend for Jupyter/web.
 
-### Geometry Representation: GeometryBasics.jl
+### 2D Cross-Section SVG Export: Luxor.jl
+CairoMakie SVG converts all text to curves and produces non-editable output — unsuitable
+for PowerPoint round-tripping. `Luxor.jl` (JuliaGraphics) generates clean, fully editable
+vector SVG with proper text nodes, polygon fills, and labels. It uses Cairo internally
+but exposes a drawing-oriented API:
 
-- Standard Julia geometry primitive types (`Point`, `Polygon`, `Mesh`, `TriangleFace`)
-- Integrates natively with Makie.jl rendering
-- Used as the output type for the mesh pipeline
+```julia
+Drawing(600, 400, :svg)
+setcolor(material_color)
+poly(cross_section_points, :fill)
+label("SiO₂", coords)
+finish()
+svgstring()   # returns the SVG XML
+```
 
-### Visualization: Makie.jl
-
-| Backend     | Use case                                  |
-|-------------|-------------------------------------------|
-| `GLMakie`   | Interactive 2D/3D in a native OS window   |
-| `WGLMakie`  | Interactive 2D/3D in Jupyter / browser    |
-| `CairoMakie`| High-quality vector/raster export (PNG/SVG/PDF) |
-
-The visualization layer will be backend-agnostic; callers choose the backend by importing
-it before calling the display functions.
+Material cross-hatching (conventional notation: \\\\ for Si, /// for SiO₂, etc.) is
+achieved by drawing a clipped repeating line pattern inside the polygon bounds, a standard
+Luxor technique.
 
 ---
 
-## Internal Data Model
+## Data Model
 
 ```julia
-# src/model.jl
+# src/model.jl   ← GDS types (unchanged from original plan)
+# src/process.jl ← process simulation types
 
-struct GDSTransform
-    magnification::Float64   # default 1.0
-    angle::Float64           # degrees, default 0.0
-    reflect_x::Bool          # x-axis reflection before rotation
-    origin::Tuple{Float64, Float64}
+struct MaterialSpec
+    name::Symbol
+    color::RGBA{Float32}
+    hatch_pattern::Symbol   # :none, :diagonal, :cross, :dot, :horizontal
 end
 
-const IDENTITY_TRANSFORM = GDSTransform(1.0, 0.0, false, (0.0, 0.0))
+# Built-in material palette (user can extend)
+const MATERIALS = Dict{Symbol, MaterialSpec}(
+    :silicon    => MaterialSpec(:silicon,   RGBA(0.6, 0.6, 0.7, 1.0), :diagonal),
+    :sio2       => MaterialSpec(:sio2,      RGBA(0.8, 0.9, 1.0, 0.8), :none),
+    :poly       => MaterialSpec(:poly,      RGBA(0.4, 0.4, 0.4, 1.0), :horizontal),
+    :metal1     => MaterialSpec(:metal1,    RGBA(0.9, 0.8, 0.2, 1.0), :none),
+    :photoresist=> MaterialSpec(:photoresist,RGBA(0.9, 0.5, 0.1, 0.6), :none),
+)
 
-struct Boundary
-    layer::Int
-    datatype::Int
-    xy::Vector{Tuple{Float64, Float64}}  # closed polygon (first == last)
+struct WorldState
+    solids::Vector{MaterialSolid}
+    surface::SurfaceMap          # current top-of-stack height map
+    step_name::String
+    step_index::Int
 end
 
-struct Path
-    layer::Int
-    datatype::Int
-    pathtype::Int            # 0 = flush, 1 = round, 2 = square extended
-    width::Float64
-    xy::Vector{Tuple{Float64, Float64}}
-end
-
-struct CellRef              # SREF
-    cell_name::String
-    transform::GDSTransform
-end
-
-struct ArrayRef             # AREF
-    cell_name::String
-    transform::GDSTransform
-    rows::Int
-    cols::Int
-    row_spacing::Tuple{Float64, Float64}
-    col_spacing::Tuple{Float64, Float64}
-end
-
-struct TextElement
-    layer::Int
-    texttype::Int
-    text::String
-    transform::GDSTransform
-end
-
-struct Cell
-    name::String
-    boundaries::Vector{Boundary}
-    paths::Vector{Path}
-    cell_refs::Vector{CellRef}
-    array_refs::Vector{ArrayRef}
-    texts::Vector{TextElement}
-end
-
-struct GDSLibrary
-    name::String
-    user_unit::Float64       # meters per user unit
-    db_unit::Float64         # meters per database unit
-    cells::Dict{String, Cell}
+struct ProcessResult
+    gds::GDSLibrary
+    steps::Vector{WorldState}    # one snapshot per named process step
+    wafer_extent::BBox2D         # bounding box used as "full wafer" polygon
 end
 ```
 
-### Coordinate System
+---
 
-GDSII coordinates are stored as integer database units. The `db_unit` field (typically
-`1e-9` m, i.e. 1 nm) converts to physical units. The parser will store coordinates as
-`Float64` in database units; consumers multiply by `db_unit` to get meters, or by
-`user_unit / db_unit` to get the user-defined unit (often micrometers).
+## Process Flow API
+
+```julia
+# src/process_api.jl
+
+proc = ProcessFlow(gds_library)
+
+# Declare the silicon substrate (extends downward from z=0)
+substrate!(proc, :silicon; thickness=500.0)
+
+# Blanket deposition — covers the entire wafer at the current surface height
+deposit!(proc, :sio2, 0.002;  name="Gate oxide")
+
+# Masked deposition — deposits only where the GDS mask polygon covers
+deposit!(proc, :poly, 0.050;
+    mask=gds_layer(1),
+    tone=:positive,             # :positive = deposit where mask covers
+    name="Poly gate dep.")
+
+# Masked anisotropic etch — removes material in the unmasked region
+etch!(proc, :poly;
+    mask=gds_layer(1),
+    tone=:positive,             # :positive = keep where mask covers
+    depth=:all,                 # :all removes the full layer, or a Float64 value
+    name="Poly gate etch")
+
+# CMP — planarize to a target Z level
+cmp!(proc; target_z=0.052, name="Post-poly CMP")
+
+# Implant region (visual annotation; does not affect surface topology)
+implant!(proc, :boron;
+    mask=gds_layer(2),
+    z_range=(-0.05, 0.0),
+    name="S/D implant")
+
+# Snapshot without process change (annotate current state)
+snapshot!(proc, "After LDD spacer")
+
+# Run the simulation — returns ProcessResult with all WorldState snapshots
+result = simulate(proc)
+```
+
+### Tone Convention
+
+| `tone`      | mask meaning                                |
+|-------------|---------------------------------------------|
+| `:positive` | operation applies where mask polygon covers |
+| `:negative` | operation applies where mask is absent      |
+
+### Surface Topology Handling
+
+After each process step, the surface map is updated:
+
+- **Deposit (blanket)**: raise all surface regions by `thickness`; add one new
+  `MaterialSolid` spanning the full wafer extent from `old_z` to `old_z + thickness`.
+
+- **Deposit (masked, tone=:positive)**:
+  1. Clip the deposit footprint polygon to the mask: `footprint = wafer ∩ mask_polygon`
+  2. The surface map is split: the footprint region rises by `thickness`; the rest stays
+  3. Add new `MaterialSolid` for the footprint only
+  4. Update `SurfaceMap` using Clipper difference/intersection
+
+- **Etch (masked, anisotropic)**:
+  1. Compute etch footprint: `footprint = wafer - mask_polygon` (for tone=:positive)
+  2. For each existing solid intersecting the footprint, clip its XY polygon using
+     Clipper difference to remove the etched region; if `depth=:all`, remove the entire
+     solid in that region; otherwise reduce `z_top` by `depth`
+  3. Update surface map in the etched region (drop by `depth` or to the revealed surface)
+
+- **CMP**: for all solids where `z_top > target_z`, set `z_top = target_z`; remove
+  zero-thickness solids; rebuild surface map as `target_z` everywhere above that level.
+
+The `SurfaceMap` is computed from the solid list on demand (max of all `z_top` values per
+XY region) rather than maintained incrementally, to avoid cumulative clipping errors.
 
 ---
 
 ## Phases
 
-### Phase 1: GDSII Binary Parser
+### Phase 1: GDS Loading (unchanged)
 
-**Files**: `src/parser.jl`
+**Files**: `src/model.jl`, `src/parser.jl`
 
-Implement a streaming binary reader that walks the record sequence and populates the
-`GDSLibrary` model.
+Same as the original plan: custom binary GDSII reader, IBM hex float conversion,
+`GDSLibrary` / `Cell` / `Boundary` / `Path` / `CellRef` / `ArrayRef` types.
+`load_gds(path)` → `GDSLibrary`.
 
-#### Record Reading
+Then `flatten(lib, top_cell)` → `Vector{FlatPolygon}` (resolved hierarchy, paths
+expanded to closed polygons).
 
-```
-Each record:
-  bytes 0–1: record length (including the 4-byte header)
-  bytes 2–3: {record_type (1 byte), data_type (1 byte)}
-  bytes 4–(length-1): payload
-```
+The flat polygon list is the source of mask shapes for process step operations.
 
-Data types and their Julia mappings:
+### Phase 2: Process Simulation Engine
 
-| Data type code | GDSII type       | Julia type      |
-|----------------|------------------|-----------------|
-| `0x00`         | No data          | —               |
-| `0x01`         | Bit array        | `UInt16`        |
-| `0x02`         | 2-byte int       | `Int16`         |
-| `0x03`         | 4-byte int       | `Int32`         |
-| `0x05`         | 8-byte real      | special (below) |
-| `0x06`         | ASCII string     | `String`        |
+**Files**: `src/process_api.jl`, `src/process_sim.jl`, `src/polygon_ops.jl`
 
-GDSII 8-byte reals are a non-IEEE format (IBM hex floating point). A conversion function
-must be implemented:
+#### `polygon_ops.jl` — thin wrapper around Clipper.jl
 
 ```julia
-function gds_real_to_float64(bytes::NTuple{8, UInt8})::Float64
-    sign = (bytes[1] & 0x80) != 0 ? -1.0 : 1.0
-    exp  = Int(bytes[1] & 0x7F) - 64       # excess-64 base-16 exponent
-    mantissa = 0.0
-    for i in 2:8
-        mantissa = (mantissa + bytes[i]) / 256.0
-    end
-    return sign * mantissa * 16.0^exp
-end
+# Convert between Float64 tuples and Clipper's integer points
+const CLIPPER_SCALE = 1_000_000   # 1nm resolution at 1µm user units
+
+function clip_difference(subject, clip)   # returns Vector{Vector{Tuple{Float64,Float64}}}
+function clip_union(a, b)
+function clip_intersection(a, b)
+function polygon_area(pts)
+function point_in_polygon(pt, polygon)   # for surface map queries
 ```
 
-#### Record Types to Handle
+#### `process_sim.jl` — simulation loop
 
-| Record       | Action                                                    |
-|--------------|-----------------------------------------------------------|
-| `HEADER`     | Validate version (should be 600)                          |
-| `BGNLIB`     | Start library                                             |
-| `LIBNAME`    | Store library name                                        |
-| `UNITS`      | Read two 8-byte GDS reals: user_unit, db_unit             |
-| `ENDLIB`     | Finish                                                    |
-| `BGNSTR`     | Start a new `Cell`                                        |
-| `STRNAME`    | Set cell name                                             |
-| `ENDSTR`     | Finalize current cell, insert into library                |
-| `BOUNDARY`   | Begin polygon element                                     |
-| `PATH`       | Begin path element                                        |
-| `SREF`       | Begin cell reference                                      |
-| `AREF`       | Begin array reference                                     |
-| `TEXT`       | Begin text element                                        |
-| `ENDEL`      | End current element, push to cell                         |
-| `LAYER`      | Set layer on current element                              |
-| `DATATYPE`   | Set datatype on current element                           |
-| `WIDTH`      | Set width on current path                                 |
-| `PATHTYPE`   | Set pathtype on current path                              |
-| `XY`         | Read coordinate list (pairs of Int32)                     |
-| `SNAME`      | Set referenced structure name                             |
-| `COLROW`     | Set cols and rows for AREF                                |
-| `STRANS`     | Set transform flags (bit 15 = x-reflect)                  |
-| `MAG`        | Set magnification                                         |
-| `ANGLE`      | Set rotation angle                                        |
-| `STRING`     | Set text content                                          |
-| `TEXTTYPE`   | Set texttype on text element                              |
+`simulate(proc::ProcessFlow)::ProcessResult`:
+1. Initialise `WorldState` with the substrate solid and flat surface map at z=0
+2. For each step in `proc.steps`:
+   - Call the step's handler with current `WorldState` and the GDS flat polygons
+   - Handler returns a new `WorldState`
+   - Append to the `steps` vector
+3. Return `ProcessResult`
 
-#### Public API
-
-```julia
-load_gds(path::AbstractString)::GDSLibrary
-load_gds(io::IO)::GDSLibrary
-```
-
-### Phase 2: Hierarchy Flattening
-
-**Files**: `src/flatten.jl`
-
-The GDSII cell hierarchy must be resolved into a flat list of `(layer, polygon_points)`
-pairs for rendering and meshing. Flattening respects the `GDSTransform` on each reference.
-
-#### Transform Application
-
-A `GDSTransform` encodes: magnification `m`, rotation angle `θ` (degrees), x-reflection
-`r`, and translation origin `(tx, ty)`.
-
-Applied to a point `(x, y)`:
-1. Scale: `(mx, my)`
-2. If `reflect_x`: negate y → `(mx, -my)`
-3. Rotate by `θ`: standard 2D rotation matrix
-4. Translate: add `(tx, ty)`
-
-#### Path Expansion
-
-A GDSII PATH with width `w` is expanded into a closed polygon by offsetting each segment
-perpendicularly by `w/2`. Endcap style is determined by `pathtype`. This produces a
-`Boundary`-equivalent polygon on the same layer.
-
-#### Flat Geometry Output
-
-```julia
-struct FlatPolygon
-    layer::Int
-    datatype::Int
-    points::Vector{Tuple{Float64, Float64}}  # in user units (micrometers typically)
-end
-
-function flatten(lib::GDSLibrary, top_cell::String)::Vector{FlatPolygon}
-```
-
-**Algorithm**:
-- Recursive DFS starting at `top_cell`
-- Maintain a cumulative `GDSTransform` stack (composed via matrix multiplication)
-- For AREF: iterate over all `rows × cols` instances, computing per-instance translations
-- Memoize flattened child cells in their own coordinate frame, then transform the result
-  (avoids re-flattening shared cells)
-- Detect cyclic references and error
-
-### Phase 3: 2D Visualization
-
-**Files**: `src/viz2d.jl`
-
-Render all flat polygons grouped by layer as a 2D diagram using Makie.
-
-#### Layer Color Map
-
-Assign a deterministic color to each layer using a categorical color palette (e.g., 20
-distinct colors cycling for layer indices). Support a user-provided `Dict{Int, RGBA}`
-override.
-
-#### Drawing
-
-```julia
-function draw2d(
-    polygons::Vector{FlatPolygon};
-    layer_colors::Dict{Int, Any} = auto_colors(polygons),
-    visible_layers::Union{Nothing, Set{Int}} = nothing,
-    backend = :gl,  # :gl | :wgl | :cairo
-)::Figure
-```
-
-For each layer (in ascending order, so higher layers draw on top):
-- Convert polygon point list to `GeometryBasics.Polygon`
-- Use `Makie.poly!(ax, polygon; color=..., strokewidth=0.5, strokecolor=:black)`
-
-Add a layer legend keyed by layer number. Support axis labels in micrometers.
-
-#### Export
-
-```julia
-save_2d(path::AbstractString, polygons::Vector{FlatPolygon}; kwargs...)
-```
-
-Infer format from extension: `.png`, `.svg`, `.pdf` → use `CairoMakie`.
-
-### Phase 4: 3D Mesh Generation
+### Phase 3: 3D Mesh Builder
 
 **Files**: `src/mesh3d.jl`
 
-Generate a 3D solid mesh for each layer by triangulating 2D polygons and extruding them
-between a bottom and top Z coordinate.
+Converts a `WorldState` into a renderable `Vector{(MaterialSpec, GeometryBasics.Mesh)}`.
 
-#### Layer Stack Definition
-
-```julia
-struct LayerSpec
-    layer::Int
-    datatype::Int           # -1 matches any
-    z_min::Float64          # in same units as XY (e.g., micrometers)
-    z_max::Float64
-end
-
-const DEFAULT_LAYER_STACK = LayerSpec[]  # empty → equal-spaced synthetic stack
-```
-
-The user provides a `Vector{LayerSpec}` that maps layer numbers to physical Z extents
-(e.g., derived from a process design kit). If no stack is provided, layers are assigned
-synthetic 1 µm thick slabs stacked at 1 µm intervals.
-
-#### Triangulation
-
-For each `FlatPolygon`:
-1. Optionally remove duplicate or near-duplicate vertices
-2. Use `EarCut.jl` for simple polygons (no holes, convex or concave)
-3. Use `Triangulate.jl` with `"pa$(area)q20Q"` flags for complex polygons or those
-   containing holes (holes are identified by containment testing with even-odd rule)
-4. Output: `faces::Vector{Tuple{Int,Int,Int}}` indexing into `points`
-
-#### Solid Extrusion
-
-Given triangulated top face (points in XY, indices in `faces`), build the 3D solid:
-
-1. **Top face**: emit each triangle as `(p[i], p[j], p[k])` at `z = z_max`
-2. **Bottom face**: emit each triangle with reversed winding `(p[k], p[j], p[i])` at
-   `z = z_min`
-3. **Side walls**: walk the polygon boundary edges; for each edge `(a, b)`, emit two
-   triangles forming the quad `(a_bot, b_bot, b_top, a_top)`:
-   - Triangle 1: `(a_bot, b_bot, b_top)`
-   - Triangle 2: `(a_bot, b_top, a_top)`
-
-Output as `GeometryBasics.Mesh`.
+For each `MaterialSolid`:
+1. Triangulate `polygon` using EarCut.jl (holes detected by signed area / containment)
+2. Build a closed prism mesh:
+   - **Top** and **bottom** faces from triangulation (reversed winding for bottom)
+   - **Side walls** from boundary edge quads
+3. Output as `GeometryBasics.Mesh`
 
 ```julia
-function build_mesh(
-    polygons::Vector{FlatPolygon},
-    layer_stack::Vector{LayerSpec};
-    quality::Bool = false,
-)::Vector{Tuple{LayerSpec, GeometryBasics.Mesh}}
+function build_meshes(state::WorldState)::Vector{Tuple{MaterialSpec, Mesh}}
 ```
 
-### Phase 5: 3D Visualization
+### Phase 4: Interactive 3D Viewer
 
 **Files**: `src/viz3d.jl`
 
-Render all layer meshes in a single interactive Makie 3D scene.
+The viewer presents the 3D structure with a step slider allowing the operator to step
+through all captured `WorldState` snapshots.
 
 ```julia
-function draw3d(
-    meshes::Vector{Tuple{LayerSpec, GeometryBasics.Mesh}};
-    layer_colors::Dict{Int, Any} = auto_colors_3d(meshes),
-    visible_layers::Union{Nothing, Set{Int}} = nothing,
-    backend = :gl,
-)::Figure
+function view3d(result::ProcessResult; backend=:gl)
 ```
 
-For each mesh:
+#### Makie Observable architecture
+
+```
+step_index::Observable{Int}     ← driven by Slider
+       │
+       ▼
+current_state = @lift result.steps[$step_index]
+       │
+       ▼
+meshes = @lift build_meshes($current_state)
+       │
+       ▼
+Makie mesh!() plot objects (one per material, updated reactively)
+```
+
+The figure layout:
+```
+┌─────────────────────────────────────────────────┐
+│  [Step 3/12: Poly gate etch]                    │
+│                                                 │
+│        3D scene (camera: rotate/zoom)           │
+│                                                 │
+│                                                 │
+├─────────────────────────────────────────────────┤
+│  ◀  [●─────────────────────────] ▶   step 3/12 │
+├─────────────────────────────────────────────────┤
+│  [☑ silicon] [☑ sio2] [☑ poly]  ← layer toggle │
+└─────────────────────────────────────────────────┘
+```
+
+Controls:
+- **Slider**: scrub through process steps
+- **◀ / ▶ buttons**: single step forward/backward
+- **Layer toggles**: checkboxes per material (hide/show individually)
+- **Opacity slider** per material (useful for seeing buried structures)
+- **Camera**: GLMakie built-in mouse orbit/zoom
+
+### Phase 5: Cross-Section Slicer
+
+**Files**: `src/slicer.jl`
+
+Computes a 2D cross-section of the 3D structure at an arbitrary plane.
+
+#### Slice definition
+
 ```julia
-mesh!(ax, m; color=color, transparency=false, shading=true)
+abstract type SlicePlane end
+
+struct XZSlice <: SlicePlane   # vertical cut perpendicular to X axis
+    y::Float64                 # the Y coordinate of the cut
+end
+
+struct YZSlice <: SlicePlane   # vertical cut perpendicular to Y axis
+    x::Float64
+end
+
+struct XYSlice <: SlicePlane   # horizontal cut (plan view at height z)
+    z::Float64
+end
 ```
 
-Enable `Makie` 3D axis features: rotation, zoom, axis labels (X µm, Y µm, Z µm).
+#### Algorithm for `XZSlice` at `y = y0`
+
+For each `MaterialSolid(material, polygon, z_bottom, z_top)`:
+1. Find all intersections of the horizontal line `y = y0` with the polygon edges
+2. Sort intersection x-coordinates; pair them as `[(x1,x2), (x3,x4), ...]` by odd-even
+   rule (even-odd fill = inside the polygon)
+3. For each interval `[x1, x2]`, emit a 2D cross-section polygon:
+   `{(x1,z_bottom), (x2,z_bottom), (x2,z_top), (x1,z_top)}` — a rectangle
+4. Merge adjacent rectangles of the same material at the same Z range (optional
+   simplification)
+
+Output: `Vector{CrossSectionRegion}`:
+```julia
+struct CrossSectionRegion
+    material::Symbol
+    polygon::Vector{Tuple{Float64,Float64}}   # 2D, axes are (x_or_y, z)
+end
+```
+
+For curved polygons or diagonal cuts, the same algorithm generalises to arbitrary line
+intersection with polygon edges.
+
+```julia
+function slice(state::WorldState, plane::SlicePlane)::Vector{CrossSectionRegion}
+```
+
+### Phase 6: 2D Cross-Section Renderer and SVG Export
+
+**Files**: `src/viz2d.jl`
+
+Renders a `Vector{CrossSectionRegion}` as a 2D diagram and exports to SVG.
+
+#### Layout
+
+A cross-section diagram is drawn in a coordinate frame where:
+- Horizontal axis = scan direction (Y for an XZ slice, X for a YZ slice)
+- Vertical axis = Z (process height), with z=0 at the wafer surface
+- Substrate extends downward; deposited layers extend upward
+
+#### Rendering with Luxor.jl
+
+```julia
+function render_crosssection(
+    regions::Vector{CrossSectionRegion};
+    width_px::Int = 800,
+    height_px::Int = 400,
+    show_labels::Bool = true,
+    show_hatching::Bool = true,
+    format::Symbol = :svg,   # :svg | :png | :pdf
+)::String    # returns SVG XML or file path
+```
+
+Each material region is rendered as a filled polygon with:
+- **Fill color** from the material's `MaterialSpec.color`
+- **Cross-hatch pattern** (if `show_hatching=true`): drawn as clipped diagonal/horizontal
+  lines matching the conventional notation for each material
+- **Outline stroke**: thin black border between regions
+- **Label**: material name placed at the centroid if the region is large enough
+
+#### Multiple slices
+
+```julia
+function render_process_sequence(
+    result::ProcessResult,
+    plane::SlicePlane;
+    steps::Union{Nothing, Vector{Int}} = nothing,  # nil = all steps
+    output_dir::String = ".",
+    prefix::String = "step",
+)
+# Produces step_01_gate_oxide.svg, step_02_poly_dep.svg, etc.
+```
+
+The output SVGs are sized for PowerPoint import (default 16:9 aspect, 1200×675 px
+logical size) and can be dropped directly onto slides.
 
 ---
 
@@ -386,57 +459,70 @@ Enable `Makie` 3D axis features: rotation, zoom, axis labels (X µm, Y µm, Z µ
 semiflowviz/
 ├── Project.toml
 ├── src/
-│   ├── SemiflowViz.jl      # module root, re-exports public API
-│   ├── model.jl             # GDSLibrary, Cell, Boundary, etc.
-│   ├── parser.jl            # load_gds()
-│   ├── flatten.jl           # flatten(), path expansion, transform composition
-│   ├── mesh3d.jl            # build_mesh(), LayerSpec
-│   ├── viz2d.jl             # draw2d(), save_2d()
-│   └── viz3d.jl             # draw3d()
+│   ├── SemiflowViz.jl         # module root
+│   ├── model.jl               # GDSLibrary, Cell, Boundary, Path, …
+│   ├── parser.jl              # load_gds(), IBM hex float conversion
+│   ├── flatten.jl             # flatten(), transform composition, path expansion
+│   ├── polygon_ops.jl         # Clipper.jl wrappers: difference, union, intersect
+│   ├── process_api.jl         # ProcessFlow, deposit!, etch!, cmp!, …
+│   ├── process_sim.jl         # simulate(), WorldState engine
+│   ├── mesh3d.jl              # build_meshes(), prism extrusion, EarCut
+│   ├── viz3d.jl               # view3d(), GLMakie interactive viewer
+│   ├── slicer.jl              # slice(), XZSlice / YZSlice / XYSlice
+│   └── viz2d.jl               # render_crosssection(), SVG/PNG export, Luxor
 ├── test/
 │   ├── runtests.jl
 │   ├── test_parser.jl
 │   ├── test_flatten.jl
-│   └── test_mesh.jl
+│   ├── test_polygon_ops.jl
+│   ├── test_process_sim.jl
+│   └── test_slicer.jl
 └── examples/
-    ├── simple_inverter.jl   # end-to-end example with a small embedded GDS
-    └── layer_stack.jl       # example with custom LayerSpec
+    ├── nmos_transistor.jl     # simple NMOS cross-section flow
+    └── metal_interconnect.jl  # via / dual-damascene stack example
 ```
 
 ### Project.toml Dependencies
 
 ```toml
 [deps]
-EarCut = "..."
-GeometryBasics = "..."
-Makie = "..."
-Triangulate = "..."
+Clipper        = "…"   # 2D polygon boolean ops
+EarCut         = "…"   # polygon triangulation for rendering
+GeometryBasics = "…"   # 3D mesh types
+Luxor          = "…"   # SVG/PNG 2D cross-section export
+Makie          = "…"   # visualization framework (abstract)
 
 [weakdeps]
-CairoMakie = "..."
-GLMakie = "..."
-WGLMakie = "..."
-```
+GLMakie        = "…"   # native OS window (default interactive backend)
+WGLMakie       = "…"   # Jupyter / browser backend
+CairoMakie     = "…"   # raster/vector export
 
-CairoMakie/GLMakie/WGLMakie are weak dependencies so the package does not force a GUI
-backend on users who only want mesh output.
+[extensions]
+SemiflowVizGLMakieExt    = "GLMakie"
+SemiflowVizWGLMakieExt   = "WGLMakie"
+SemiflowVizCairoMakieExt = "CairoMakie"
+```
 
 ---
 
 ## Implementation Order
 
-| Step | Deliverable                                               | Key dependency          |
-|------|-----------------------------------------------------------|-------------------------|
-| 1    | `model.jl` — type definitions                            | none                    |
-| 2    | `parser.jl` — binary reader, GDS real conversion         | none                    |
-| 3    | Parser tests with a hand-crafted minimal GDS binary       | Step 2                  |
-| 4    | `flatten.jl` — transform math, path expansion, DFS       | Steps 1–2               |
-| 5    | Flatten tests: SREF, AREF, nested cells                  | Step 4                  |
-| 6    | `viz2d.jl` — polygon rendering, layer colors             | Steps 4, Makie          |
-| 7    | `mesh3d.jl` — triangulation, extrusion                   | Steps 4, EarCut/Triangulate, GeometryBasics |
-| 8    | `viz3d.jl` — 3D scene, layer stack                       | Steps 7, Makie          |
-| 9    | End-to-end example with a real GDS file                  | Steps 6–8               |
-| 10   | Export: PNG/SVG/PDF for 2D, OBJ/STL for 3D               | Steps 6–8               |
+| Step | Deliverable                                              | Depends on |
+|------|----------------------------------------------------------|------------|
+| 1    | `model.jl` + `parser.jl` (GDS binary reader)            | —          |
+| 2    | `flatten.jl` (hierarchy + transforms + path expansion)  | 1          |
+| 3    | `polygon_ops.jl` (Clipper wrappers + unit tests)        | —          |
+| 4    | `process_api.jl` (DSL types, no simulation logic yet)   | —          |
+| 5    | `process_sim.jl` — blanket deposit + substrate          | 3, 4       |
+| 6    | `process_sim.jl` — masked deposit + anisotropic etch    | 5          |
+| 7    | `process_sim.jl` — CMP + implant annotation             | 6          |
+| 8    | `mesh3d.jl` — EarCut prism extrusion                    | —          |
+| 9    | `viz3d.jl` — static 3D view of single WorldState        | 8          |
+| 10   | `viz3d.jl` — step slider + layer toggles                | 9          |
+| 11   | `slicer.jl` — XZSlice / YZSlice / XYSlice               | 5          |
+| 12   | `viz2d.jl` — Luxor rendering, hatch, labels             | 11         |
+| 13   | `viz2d.jl` — SVG export, batch process sequence         | 12         |
+| 14   | End-to-end NMOS example                                 | 1–13       |
 
 ---
 
@@ -444,9 +530,10 @@ backend on users who only want mesh output.
 
 | Risk | Mitigation |
 |------|------------|
-| GDSII files with deep cell hierarchies causing slow flatten | Cache flattened sub-cells in their local frame; apply transforms at reference site only |
-| Large files (millions of polygons) overwhelming the renderer | Implement level-of-detail thinning (skip sub-pixel polygons) and optional layer filtering |
-| Polygons with holes (e.g., ring structures) breaking ear-clip | Detect holes via containment; route to Triangulate.jl with hole points |
-| Non-simple polygons (self-intersecting) from malformed GDS | Pre-process with polygon clipping (Clipper via Clipper2.jl if needed) |
-| GDS files using GDSII version 3/5 (older variants) | Validate HEADER record version; emit clear error for unsupported versions |
-| IBM hex float precision loss | Implement exact 64-bit conversion; add unit tests against known values |
+| **Polygon fragmentation after many steps**: Clipper difference/union on complex shapes produces many tiny slivers | Simplify polygons after each step using Clipper's `SimplifyPolygon`; merge co-planar co-material solids |
+| **Surface map complexity**: after 20+ steps with several masks, the surface map can have O(N²) polygon pieces | Recompute surface map lazily from the solid list only when needed for a new deposit step; consider bounding-box early-out |
+| **Self-intersecting GDSII polygons**: malformed input files | Run Clipper `SimplifyPolygon` on all input polygons at load time |
+| **Non-vertical (isotropic) etch topology**: not modelled in v1 | Document as out-of-scope; add a `clip_offset(-radius)` path for future isotropic mode using `ClipperOffset` |
+| **GLMakie mesh update performance**: re-triangulating and updating hundreds of meshes per slider tick | Cache triangulated meshes per WorldState; only re-upload the GPU buffer when the step changes |
+| **Luxor hatch patterns**: no built-in hatching | Implement as a clipped line grid: draw lines at 45° over the polygon bounding box, then clip to the polygon path |
+| **PowerPoint SVG compatibility**: some SVG features not supported in Office | Use only basic SVG primitives (polygon, path, text); avoid gradients, filters, or advanced CSS |
